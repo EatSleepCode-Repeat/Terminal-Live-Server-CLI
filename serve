@@ -1,0 +1,187 @@
+serve() {
+    local port="${1:-8000}"
+    local dir="${2:-.}"
+    
+    # Check if port is already in use
+    if lsof -Pi :$port -sTCP:LISTEN -t >/dev/null 2>&1 ; then
+        echo "❌ Port $port is already in use"
+        echo "Try a different port: serve <port_number>"
+        return 1
+    fi
+    
+    # Check if directory exists
+    if [[ ! -d "$dir" ]]; then
+        echo "❌ Directory '$dir' does not exist"
+        return 1
+    fi
+    
+    # Check for Python
+    if ! command -v python3 &> /dev/null && ! command -v python &> /dev/null; then
+        echo "❌ Python is not installed. Please install Python to use this server."
+        return 1
+    fi
+    
+    local abs_dir="$(cd "$dir" && pwd)"
+    
+    echo "🚀 Starting server with live reload..."
+    echo "📁 Serving: $abs_dir"
+    echo "🌐 Local: http://localhost:$port"
+    echo "📡 Network: http://$(ipconfig getifaddr en0 2>/dev/null || hostname):$port"
+    echo "🔄 Live reload: ENABLED"
+    echo ""
+    echo "Press Ctrl+C to stop"
+    echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+    
+    # Create temporary Python server with live reload injection
+    local temp_server=$(mktemp)
+    cat > "$temp_server" << 'PYTHON_EOF'
+import http.server
+import socketserver
+import os
+import sys
+from urllib.parse import unquote
+
+PORT = int(sys.argv[1])
+
+class LiveReloadHandler(http.server.SimpleHTTPRequestHandler):
+    def end_headers(self):
+        # Add CORS headers
+        self.send_header('Access-Control-Allow-Origin', '*')
+        self.send_header('Cache-Control', 'no-store, no-cache, must-revalidate')
+        super().end_headers()
+    
+    def do_GET(self):
+        # Decode URL path
+        path = unquote(self.path)
+        
+        # Serve HTML files with live reload script injected
+        if path.endswith('.html') or path == '/' or (not '.' in path.split('/')[-1]):
+            try:
+                # Determine file path
+                if path == '/' or path.endswith('/'):
+                    file_path = 'index.html'
+                elif not path.endswith('.html'):
+                    file_path = path.lstrip('/') + '.html'
+                    if not os.path.exists(file_path):
+                        file_path = path.lstrip('/')
+                        if os.path.isdir(file_path):
+                            file_path = os.path.join(file_path, 'index.html')
+                else:
+                    file_path = path.lstrip('/')
+                
+                if os.path.exists(file_path) and file_path.endswith('.html'):
+                    with open(file_path, 'r', encoding='utf-8') as f:
+                        content = f.read()
+                    
+                    # Inject live reload script before </body>
+                    live_reload_script = '''
+<script>
+(function() {
+    let lastModified = {};
+    
+    async function checkForChanges() {
+        try {
+            const response = await fetch(window.location.href, {
+                method: 'HEAD',
+                cache: 'no-store'
+            });
+            const modified = response.headers.get('Last-Modified');
+            
+            if (lastModified[window.location.href] && 
+                lastModified[window.location.href] !== modified) {
+                console.log('🔄 Changes detected, reloading...');
+                window.location.reload();
+            }
+            lastModified[window.location.href] = modified;
+        } catch (e) {
+            console.log('Live reload check failed:', e);
+        }
+    }
+    
+    // Check every 500ms for changes
+    setInterval(checkForChanges, 500);
+    console.log('🔄 Live reload enabled');
+})();
+</script>
+'''
+                    if '</body>' in content.lower():
+                        content = content.replace('</body>', live_reload_script + '</body>', 1)
+                    else:
+                        content += live_reload_script
+                    
+                    # Send response
+                    self.send_response(200)
+                    self.send_header('Content-Type', 'text/html; charset=utf-8')
+                    self.send_header('Content-Length', len(content.encode('utf-8')))
+                    self.end_headers()
+                    self.wfile.write(content.encode('utf-8'))
+                    return
+            except Exception as e:
+                print(f"Error serving file: {e}")
+        
+        # For all other files, serve normally
+        super().do_GET()
+
+with socketserver.TCPServer(("", PORT), LiveReloadHandler) as httpd:
+    print(f"Server running on port {PORT}")
+    httpd.serve_forever()
+PYTHON_EOF
+    
+    # Start server
+    if command -v python3 &> /dev/null; then
+        (cd "$abs_dir" && python3 "$temp_server" "$port")
+    else
+        (cd "$abs_dir" && python "$temp_server" "$port")
+    fi
+    
+    # Cleanup
+    rm -f "$temp_server"
+}
+
+# Auto-open in browser variant
+serve-open() {
+    local port="${1:-8000}"
+    local dir="${2:-.}"
+    
+    # Start server in background
+    serve "$port" "$dir" &
+    local server_pid=$!
+    
+    # Wait a moment for server to start
+    sleep 1.5
+    
+    # Open browser
+    if command -v open &> /dev/null; then
+        open "http://localhost:$port"
+    elif command -v xdg-open &> /dev/null; then
+        xdg-open "http://localhost:$port"
+    else
+        echo "✨ Server started! Open http://localhost:$port in your browser"
+    fi
+    
+    # Wait for server process
+    wait $server_pid
+}
+
+# Kill all serve processes
+serve-kill() {
+    echo "🔍 Looking for active serve processes..."
+    local pids=$(lsof -ti:8000-9000 2>/dev/null | sort -u)
+    
+    if [[ -z "$pids" ]]; then
+        echo "✅ No active serve processes found"
+        return 0
+    fi
+    
+    echo "Found processes on ports 8000-9000:"
+    lsof -i:8000-9000 | grep LISTEN
+    echo ""
+    
+    read "response?Kill these processes? (y/n): "
+    if [[ "$response" =~ ^[Yy]$ ]]; then
+        echo "$pids" | xargs kill -9 2>/dev/null
+        echo "✅ Processes killed"
+    else
+        echo "❌ Cancelled"
+    fi
+}
